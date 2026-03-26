@@ -3,234 +3,191 @@
 # ========================
 #       CONFIG
 # ========================
-SFTP_HOST="sftp.example.com"
-SFTP_USER="username"
-SFTP_TARGET_DIR="/remote/path"
+SFTP_HOST="sftp_server"
+SFTP_USER="user"
+SFTP_TARGET_DIR="/path/to/destination"
 
 # Use SSH key if needed
-# SFTP_OPTIONS="-i /home/user/.ssh/id_rsa"
-SFTP_OPTIONS=""
+SFTP_OPTIONS="-i /home/user/.ssh/id_ed25519"
 
 LOGGING=0
 VERBOSE=0
+TRANSFER_MODE="copy"
 LOCAL_DEST=""
-TRANSFER_MODE="copy" # default copy
-DRY_RUN=0
 
 # ========================
 #       HELP
 # ========================
 show_help() {
-  echo "Usage: ${0} [options] <source_directory> [destination_directory]"
-  echo
-  echo "Options:"
-  echo "  -l                Enable logging (via logger)"
-  echo "  -v                Verbose output"
-  echo "  -m                Move instead of copy"
-  echo "  -d, --dry-run     Show actions but perform nothing"
-  echo "  -h                Show this help"
-  echo
-  echo "Behavior:"
-  echo "  - If destination_directory exists, transfer is done locally."
-  echo "  - If destination_directory is missing, SFTP upload is used."
-  echo "  - Default mode: copy"
-  echo "  - With -m: move"
-  echo
-  echo "Examples:"
-  echo "  ${0} /data/months                      # copy via SFTP"
-  echo "  ${0} -m /data/months /archive         # move locally"
-  echo "  ${0} -v -l --dry-run /data/months     # preview everything"
+  cat <<EOF
+Usage: ${0} [options] <source_directory> [destination_directory]
+
+Options:
+  -l                Enable logging (via logger)
+  -v                Verbose output
+  -m                Move instead of copy
+  -h                Show this help
+
+Behavior:
+  - If destination_directory exists, transfer is done locally.
+  - If destination_directory is missing, SFTP upload is used.
+  - Default mode: copy
+  - With -m: move
+EOF
+}
+
+# ========================
+#   Logging helpers
+# ========================
+log() {
+  ((VERBOSE)) && echo "$1"
+  ((LOGGING)) && logger -t sftp_backup "$1"
 }
 
 # ========================
 #   Parse options
 # ========================
-while getopts ":lvmhd-:" option; do
+while getopts ":lvmh-:" option; do
   case ${option} in
   l) LOGGING=1 ;;
   v) VERBOSE=1 ;;
   m) TRANSFER_MODE="move" ;;
-  d) DRY_RUN=1 ;;
   h)
     show_help
     exit 0
     ;;
   -)
-    case "${OPTARG}" in
-    dry-run) DRY_RUN=1 ;;
-    *)
-      echo "Error: Unknown option --${OPTARG}"
-      exit 1
-      ;;
-    esac
+    echo "Unknown option --${OPTARG}"
+    exit 1
     ;;
-  \?)
-    echo "Error: Invalid option"
-    show_help
+  *)
+    echo "Invalid option"
     exit 1
     ;;
   esac
 done
-
 shift $((OPTIND - 1))
 
 # ========================
-#   Validate source directory
+#   Validate arguments
 # ========================
-if [[ $# -lt 1 ]]; then
-  echo "Error: Missing source directory"
-  show_help
+[[ $# -lt 1 ]] && {
+  echo "Missing source directory"
   exit 1
-fi
+}
 
 SOURCE_DIR="${1}"
-
-if [[ ! -d "${SOURCE_DIR}" ]]; then
-  echo "Error: Source directory does not exist: ${SOURCE_DIR}"
-  ((LOGGING)) && logger -t sftp_backup "ERROR: Source dir '${SOURCE_DIR}' does not exist"
+[[ ! -d "${SOURCE_DIR}" ]] && {
+  echo "Source directory does not exist"
   exit 1
-fi
+}
 
-# ========================
-#   Optional local destination
-# ========================
 if [[ $# -eq 2 ]]; then
-  if [[ -d "${2}" ]]; then
-    LOCAL_DEST="${2}"
-    ((VERBOSE)) && echo "Local destination enabled → ${LOCAL_DEST}"
-    ((LOGGING)) && logger -t sftp_backup "Local destination: ${LOCAL_DEST}"
-  else
-    echo "Error: Destination directory does not exist: ${2}"
+  [[ -d "${2}" ]] || {
+    echo "Destination directory does not exist"
     exit 1
-  fi
+  }
+  LOCAL_DEST="${2}"
 fi
 
 # ========================
-#   Current month
+#   Helpers
 # ========================
-CURRENT_MONTH=$(date +%m)
-CURRENT_MONTH=$((10#${CURRENT_MONTH}))
+get_folder_year() {
+  stat -c %y "$1" | cut -d'-' -f1
+}
 
-((VERBOSE)) && echo "Current month: ${CURRENT_MONTH}"
-((VERBOSE)) && echo "Transfer mode: ${TRANSFER_MODE}"
-((VERBOSE)) && ((DRY_RUN)) && echo "DRY RUN MODE ENABLED"
-((LOGGING)) && logger -t sftp_backup "Start job (month ${CURRENT_MONTH}, mode ${TRANSFER_MODE}, dry ${DRY_RUN})"
+is_month_folder() {
+  [[ "$1" =~ ^[0-9]{2}$ ]]
+}
 
 # ========================
-#   SFTP upload function
+#   SFTP upload
 # ========================
 upload_sftp() {
-  local folder_path="${1}"
-  local folder_name="${2}"
+  local path="$1"
+  local month="$2"
+  local year="$3"
 
-  if ((DRY_RUN)); then
-    echo "[DRY-RUN] Would upload to SFTP: ${folder_name}"
-    echo "[DRY-RUN]   mkdir ${SFTP_TARGET_DIR}/${folder_name}"
-    echo "[DRY-RUN]   put -r \"${folder_path}\" ${SFTP_TARGET_DIR}/"
-    ((LOGGING)) && logger -t sftp_backup "DRY-RUN: Would upload ${folder_name}"
-    return 0
-  fi
+  log "Uploading ${year}/${month}"
 
-  echo "Uploading to SFTP: ${folder_name}"
-  ((LOGGING)) && logger -t sftp_backup "Uploading via SFTP: ${folder_name}"
-
-  local TMPFILE
-  TMPFILE=$(mktemp)
-
-  cat >"${TMPFILE}" <<EOF
-mkdir ${SFTP_TARGET_DIR}/${folder_name}
-put -r "${folder_path}" ${SFTP_TARGET_DIR}/
+  # Create year directory (ignore if exists)
+  sftp ${SFTP_OPTIONS} "${SFTP_USER}@${SFTP_HOST}" <<EOF
+mkdir ${SFTP_TARGET_DIR}/${year}
 EOF
 
-  sftp ${SFTP_OPTIONS} "${SFTP_USER}@${SFTP_HOST}" <"${TMPFILE}"
-  local RESULT=$?
+  # Create month directory
+  sftp ${SFTP_OPTIONS} "${SFTP_USER}@${SFTP_HOST}" <<EOF
+mkdir ${SFTP_TARGET_DIR}/${year}/${month}
+EOF
 
-  rm -f "${TMPFILE}"
+  # Upload folder
+  sftp ${SFTP_OPTIONS} "${SFTP_USER}@${SFTP_HOST}" <<EOF
+put -r "${path}" ${SFTP_TARGET_DIR}/${year}/
+EOF
 
-  if ((RESULT != 0)); then
-    echo "❌ SFTP upload failed: ${folder_name}"
-    ((LOGGING)) && logger -t sftp_backup "ERROR: Upload failed for ${folder_name}"
-    return 1
-  fi
-
-  echo "✅ Uploaded: ${folder_name}"
-  ((LOGGING)) && logger -t sftp_backup "Uploaded: ${folder_name}"
-  return 0
+  log "Uploaded ${year}/${month}"
 }
 
 # ========================
-#   Local copy/move function
+#   Local transfer
 # ========================
 transfer_local() {
-  local folder_path="${1}"
-  local folder_name="${2}"
+  local path="$1"
+  local month="$2"
+  local year="$3"
 
-  if ((DRY_RUN)); then
-    echo "[DRY-RUN] Would ${TRANSFER_MODE} ${folder_path} -> ${LOCAL_DEST}/"
-    ((LOGGING)) && logger -t sftp_backup "DRY-RUN: Would ${TRANSFER_MODE} ${folder_name} locally"
-    return
-  fi
+  local target="${LOCAL_DEST}/${year}"
 
-  echo "Local ${TRANSFER_MODE}: ${folder_name}"
+  mkdir -p "${target}"
+
   if [[ "${TRANSFER_MODE}" == "copy" ]]; then
-    cp -r "${folder_path}" "${LOCAL_DEST}/"
+    cp -r "${path}" "${target}/"
   else
-    mv "${folder_path}" "${LOCAL_DEST}/"
+    mv "${path}" "${target}/"
   fi
 
-  if [[ $? -ne 0 ]]; then
-    echo "❌ Local ${TRANSFER_MODE} failed: ${folder_name}"
-    ((LOGGING)) && logger -t sftp_backup "ERROR: Local ${TRANSFER_MODE} failed: ${folder_name}"
-  else
-    echo "✅ Local ${TRANSFER_MODE} OK: ${folder_name}"
-    ((LOGGING)) && logger -t sftp_backup "Local ${TRANSFER_MODE}: ${folder_name}"
-  fi
+  log "Local ${TRANSFER_MODE}: ${year}/${month}"
 }
 
 # ========================
-#   Process month folders
+#   Main loop
 # ========================
+CURRENT_MONTH=$(date +%m | sed 's/^0//')
+
+log "Start job (mode=${TRANSFER_MODE})"
+
 for dir in "${SOURCE_DIR}"/*; do
-  if [[ -d "${dir}" ]]; then
-    folder=$(basename "${dir}")
+  [[ -d "${dir}" ]] || continue
 
-    # must match 01..12
-    if [[ ${folder} =~ ^[0-9]{2}$ ]]; then
-      folder_month=$((10#${folder}))
+  folder=$(basename "${dir}")
 
-      if ((folder_month != CURRENT_MONTH)); then
-        ((VERBOSE)) && echo "Processing: ${folder}"
+  if ! is_month_folder "${folder}"; then
+    log "Skipping invalid folder: ${folder}"
+    continue
+  fi
 
-        # Local mode
-        if [[ -n "${LOCAL_DEST}" ]]; then
-          transfer_local "${dir}" "${folder}"
-          continue
-        fi
+  folder_month=$((10#${folder}))
+  folder_year=$(get_folder_year "${dir}")
 
-        # SFTP mode
-        upload_sftp "${dir}" "${folder}"
-        if [[ $? -eq 0 && "${TRANSFER_MODE}" == "move" ]]; then
-          if ((DRY_RUN)); then
-            echo "[DRY-RUN] Would remove: ${dir}"
-            ((LOGGING)) && logger -t sftp_backup "DRY-RUN: Would rm ${dir}"
-          else
-            rm -rf "${dir}"
-            echo "✅ Removed after upload: ${folder}"
-            ((LOGGING)) && logger -t sftp_backup "Removed source ${folder}"
-          fi
-        fi
+  if ((folder_month == CURRENT_MONTH)); then
+    log "Skipping current month: ${folder}"
+    continue
+  fi
 
-      else
-        echo "Skipping current month: ${folder}"
-        ((LOGGING)) && logger -t sftp_backup "Skip: ${folder}"
-      fi
+  log "Processing ${folder_year}/${folder}"
 
-    else
-      echo "Skipping invalid folder name: ${folder}"
-      ((LOGGING)) && logger -t sftp_backup "Invalid folder ${folder}"
+  if [[ -n "${LOCAL_DEST}" ]]; then
+    transfer_local "${dir}" "${folder}" "${folder_year}"
+  else
+    upload_sftp "${dir}" "${folder}" "${folder_year}"
+
+    if [[ "${TRANSFER_MODE}" == "move" ]]; then
+      rm -rf "${dir}"
+      log "Removed ${folder}"
     fi
   fi
 done
 
+log "Job finished."
 echo "Done."
-((LOGGING)) && logger -t sftp_backup "Job finished."
